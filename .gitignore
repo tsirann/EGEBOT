@@ -4,3 +4,5 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 *.pyc
+data/
+shot_task/screenshots

@@ -1,8 +1,9 @@
 import asyncio
 from html import escape as html_escape
+from pathlib import Path
 
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 
@@ -22,6 +23,14 @@ from database import db
 from config import SUBJECTS, MAX_VARIANTS, MAX_CUSTOM_QUESTIONS
 
 router = Router()
+TRACKED_MESSAGE_KEYS = (
+    "bot_message_id",
+    "bot_media_message_id",
+    "solution_media_message_id",
+)
+RUSSIAN_UNORDERED_DIGIT_TASKS = {
+    2, 3, 4, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24,
+}
 
 #  Вспомогательные функции
 
@@ -43,9 +52,47 @@ async def delete_by_id(bot: Bot, chat_id: int, message_id: int):
 async def cleanup_old(bot: Bot, chat_id: int, state: FSMContext):
     """Удалить предыдущее сообщение бота, если оно сохранено."""
     data = await state.get_data()
-    old = data.get("bot_message_id")
-    if old:
-        await delete_by_id(bot, chat_id, old)
+    for key in TRACKED_MESSAGE_KEYS:
+        message_id = data.get(key)
+        if message_id:
+            await delete_by_id(bot, chat_id, message_id)
+
+
+def resolve_local_path(raw_path: str | None) -> Path | None:
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.resolve()
+    return path if path.exists() else None
+
+
+async def replace_photo(
+    bot: Bot,
+    chat_id: int,
+    state: FSMContext,
+    state_key: str,
+    file_path: str | None,
+    caption: str | None = None,
+):
+    data = await state.get_data()
+    old_message_id = data.get(state_key)
+    if old_message_id:
+        await delete_by_id(bot, chat_id, old_message_id)
+
+    path = resolve_local_path(file_path)
+    if path is None:
+        await state.update_data(**{state_key: None})
+        return None
+
+    message = await bot.send_photo(
+        chat_id,
+        photo=FSInputFile(str(path)),
+        caption=caption,
+    )
+    await state.update_data(**{state_key: message.message_id})
+    return message
 
 
 async def show(source, state: FSMContext, text: str, reply_markup=None):
@@ -88,6 +135,24 @@ def normalize_answer(answer: str) -> str:
     a = answer.strip().lower()
     a = a.replace(",", "").replace(";", "").replace("  ", " ")
     return a
+
+
+def is_correct_answer(question: dict, user_answer: str) -> bool:
+    normalized_user = normalize_answer(user_answer)
+    normalized_correct = normalize_answer(question["answer"])
+
+    if normalized_user == normalized_correct:
+        return True
+
+    if (
+        question.get("subject_code") == "russian"
+        and question.get("task_number") in RUSSIAN_UNORDERED_DIGIT_TASKS
+        and normalized_user.isdigit()
+        and normalized_correct.isdigit()
+    ):
+        return sorted(normalized_user) == sorted(normalized_correct)
+
+    return False
 
 
 def pct(correct: int, total: int) -> str:
@@ -392,18 +457,41 @@ async def _show_question(bot: Bot, chat_id: int, state: FSMContext):
     total = len(questions)
     info = SUBJECTS[q["subject_code"]]
 
-    text = (
-        f"📝 <b>Вопрос {idx + 1}/{total}</b>  |  "
-        f"Задание №{q['task_number']} ({info['emoji']} {info['name']})\n\n"
-        f"{html_escape(q['text'])}\n\n"
-        f"✏️ <i>Введите ваш ответ:</i>"
-    )
+    has_question_image = resolve_local_path(q.get("question_image_path")) is not None
+    if has_question_image:
+        text = (
+            f"📝 <b>Вопрос {idx + 1}/{total}</b>  |  "
+            f"Задание №{q['task_number']} ({info['emoji']} {info['name']})\n\n"
+            "Условие отправлено отдельной картинкой ниже.\n\n"
+            "✏️ <i>Введите ваш ответ:</i>"
+        )
+    else:
+        text = (
+            f"📝 <b>Вопрос {idx + 1}/{total}</b>  |  "
+            f"Задание №{q['task_number']} ({info['emoji']} {info['name']})\n\n"
+            f"{html_escape(q['text'])}\n\n"
+            f"✏️ <i>Введите ваш ответ:</i>"
+        )
 
     msg_id = data.get("bot_message_id")
     if msg_id:
         try:
             await bot.edit_message_text(
                 text=text, chat_id=chat_id, message_id=msg_id,
+            )
+            await replace_photo(
+                bot,
+                chat_id,
+                state,
+                "solution_media_message_id",
+                None,
+            )
+            await replace_photo(
+                bot,
+                chat_id,
+                state,
+                "bot_media_message_id",
+                q.get("question_image_path"),
             )
             await state.set_state(TestStates.solving)
             return
@@ -412,6 +500,20 @@ async def _show_question(bot: Bot, chat_id: int, state: FSMContext):
 
     msg = await bot.send_message(chat_id, text)
     await state.update_data(bot_message_id=msg.message_id)
+    await replace_photo(
+        bot,
+        chat_id,
+        state,
+        "solution_media_message_id",
+        None,
+    )
+    await replace_photo(
+        bot,
+        chat_id,
+        state,
+        "bot_media_message_id",
+        q.get("question_image_path"),
+    )
     await state.set_state(TestStates.solving)
 
 #  Приём ответа
@@ -431,7 +533,7 @@ async def msg_answer(message: Message, state: FSMContext):
     total = len(questions)
 
     correct_answer = q["answer"]
-    is_correct = normalize_answer(user_answer) == normalize_answer(correct_answer)
+    is_correct = is_correct_answer(q, user_answer)
 
     # Сохраняем попытку
     await db.add_attempt(message.from_user.id, q["id"], user_answer, is_correct)
@@ -446,16 +548,20 @@ async def msg_answer(message: Message, state: FSMContext):
     })
     await state.update_data(results=results)
 
+    solution_image_path = q.get("solution_image_path")
+    has_solution_image = resolve_local_path(solution_image_path) is not None
+
     # Формируем сообщение с результатом
     if is_correct:
         text = "✅ <b>Верно!</b>\n\n"
     else:
-        text = (
-            f"❌ <b>Неверно!</b>\n"
-            f"Правильный ответ: <b>{html_escape(correct_answer)}</b>\n\n"
-        )
+        text = "❌ <b>Неверно!</b>\n\n"
 
-    if q.get("explanation"):
+    text += f"Правильный ответ: <b>{html_escape(correct_answer)}</b>\n\n"
+
+    if has_solution_image:
+        text += "🖼 Решение отправил отдельной картинкой ниже.\n\n"
+    elif q.get("explanation"):
         text += f"💡 {html_escape(q['explanation'])}\n\n"
 
     text += f"Прогресс: {idx + 1}/{total}"
@@ -464,6 +570,14 @@ async def msg_answer(message: Message, state: FSMContext):
     kb = finish_kb() if is_last else next_question_kb()
 
     await show(message, state, text, reply_markup=kb)
+    await replace_photo(
+        message.bot,
+        message.chat.id,
+        state,
+        "solution_media_message_id",
+        solution_image_path,
+        caption=f"Решение к заданию №{q['task_number']}",
+    )
     await state.set_state(TestStates.showing_result)
 
 #  Далее / Завершить
@@ -515,9 +629,15 @@ async def cb_finish(callback: CallbackQuery, state: FSMContext):
     # Сохраняем bot_message_id, но очищаем тестовые данные
     msg_data = await state.get_data()
     bot_msg = msg_data.get("bot_message_id")
+    bot_media = msg_data.get("bot_media_message_id")
+    solution_media = msg_data.get("solution_media_message_id")
     await state.clear()
     if bot_msg:
         await state.update_data(bot_message_id=bot_msg)
+    if bot_media:
+        await delete_by_id(callback.bot, callback.message.chat.id, bot_media)
+    if solution_media:
+        await delete_by_id(callback.bot, callback.message.chat.id, solution_media)
 
 #  Кнопки «Назад»
 
@@ -527,7 +647,10 @@ async def cb_back(callback: CallbackQuery, state: FSMContext):
     target = callback.data.split(":")[1]
 
     if target == "menu":
-        bot_msg = (await state.get_data()).get("bot_message_id")
+        data = await state.get_data()
+        bot_msg = data.get("bot_message_id")
+        bot_media = data.get("bot_media_message_id")
+        solution_media = data.get("solution_media_message_id")
         await state.clear()
         if bot_msg:
             await delete_by_id(callback.bot, callback.message.chat.id, bot_msg)
@@ -536,6 +659,10 @@ async def cb_back(callback: CallbackQuery, state: FSMContext):
                 await callback.message.delete()
             except Exception:
                 pass
+        if bot_media:
+            await delete_by_id(callback.bot, callback.message.chat.id, bot_media)
+        if solution_media:
+            await delete_by_id(callback.bot, callback.message.chat.id, solution_media)
         await callback.message.answer(
             "Выберите действие 👇", reply_markup=main_menu_kb()
         )

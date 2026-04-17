@@ -16,6 +16,7 @@ class Database:
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA foreign_keys=ON")
         await self._create_tables()
+        await self._migrate_tables()
         await self._ensure_subjects()
 
     async def _create_tables(self):
@@ -32,8 +33,10 @@ class Database:
                 task_number INTEGER NOT NULL,
                 text TEXT NOT NULL,
                 image_url TEXT,
+                question_image_path TEXT,
                 answer TEXT NOT NULL,
                 explanation TEXT,
+                solution_image_path TEXT,
                 source_url TEXT,
                 source_id TEXT
             );
@@ -79,6 +82,22 @@ class Database:
                 ON questions(subject_id, source_id);
         """)
 
+    async def _migrate_tables(self):
+        await self._ensure_column("questions", "question_image_path", "TEXT")
+        await self._ensure_column("questions", "solution_image_path", "TEXT")
+
+    async def _ensure_column(self, table_name: str, column_name: str, column_type: str):
+        async with self.db.execute(f"PRAGMA table_info({table_name})") as cur:
+            rows = await cur.fetchall()
+        columns = {row["name"] for row in rows}
+        if column_name in columns:
+            return
+
+        await self.db.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+        )
+        await self.db.commit()
+
     async def _ensure_subjects(self):
         for code, info in SUBJECTS.items():
             await self.db.execute(
@@ -99,6 +118,48 @@ class Database:
         ) as cur:
             row = await cur.fetchone()
             return row["id"] if row else None
+
+    async def get_question_id_by_source(
+        self,
+        subject_code: str,
+        source_id: str,
+    ) -> int | None:
+        subject_id = await self.get_subject_id(subject_code)
+        if subject_id is None:
+            return None
+
+        async with self.db.execute(
+            "SELECT id FROM questions WHERE subject_id = ? AND source_id = ?",
+            (subject_id, source_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return row["id"] if row else None
+
+    async def get_existing_source_ids(
+        self,
+        subject_code: str,
+        task_number: int | None = None,
+    ) -> set[str]:
+        subject_id = await self.get_subject_id(subject_code)
+        if subject_id is None:
+            return set()
+
+        if task_number is None:
+            query = """
+                SELECT source_id FROM questions
+                WHERE subject_id = ? AND source_id IS NOT NULL
+            """
+            params = (subject_id,)
+        else:
+            query = """
+                SELECT source_id FROM questions
+                WHERE subject_id = ? AND task_number = ? AND source_id IS NOT NULL
+            """
+            params = (subject_id, task_number)
+
+        async with self.db.execute(query, params) as cur:
+            rows = await cur.fetchall()
+        return {row["source_id"] for row in rows if row["source_id"]}
 
     # ── Users ──
 
@@ -134,6 +195,8 @@ class Database:
         answer: str,
         explanation: str = None,
         image_url: str = None,
+        question_image_path: str = None,
+        solution_image_path: str = None,
         source_url: str = None,
         source_id: str = None,
     ) -> int | None:
@@ -143,18 +206,59 @@ class Database:
 
         if source_id:
             async with self.db.execute(
-                "SELECT id FROM questions WHERE subject_id = ? AND source_id = ?",
+                """SELECT id, text, answer, explanation, image_url,
+                          question_image_path, solution_image_path, source_url
+                   FROM questions
+                   WHERE subject_id = ? AND source_id = ?""",
                 (subject_id, source_id),
             ) as cur:
                 existing = await cur.fetchone()
                 if existing:
+                    await self.db.execute(
+                        """UPDATE questions
+                           SET task_number = ?,
+                               text = ?,
+                               answer = ?,
+                               explanation = ?,
+                               image_url = ?,
+                               question_image_path = ?,
+                               solution_image_path = ?,
+                               source_url = ?
+                           WHERE id = ?""",
+                        (
+                            task_number,
+                            text or existing["text"],
+                            answer or existing["answer"],
+                            explanation or existing["explanation"],
+                            image_url or existing["image_url"],
+                            question_image_path or existing["question_image_path"],
+                            solution_image_path or existing["solution_image_path"],
+                            source_url or existing["source_url"],
+                            existing["id"],
+                        ),
+                    )
+                    await self.db.commit()
                     return existing["id"]
 
         await self.db.execute(
             """INSERT INTO questions
-               (subject_id, task_number, text, answer, explanation, image_url, source_url, source_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (subject_id, task_number, text, answer, explanation, image_url, source_url, source_id),
+               (
+                   subject_id, task_number, text, answer, explanation, image_url,
+                   question_image_path, solution_image_path, source_url, source_id
+               )
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                subject_id,
+                task_number,
+                text,
+                answer,
+                explanation,
+                image_url,
+                question_image_path,
+                solution_image_path,
+                source_url,
+                source_id,
+            ),
         )
         await self.db.commit()
 
@@ -164,8 +268,9 @@ class Database:
 
     async def get_question_by_id(self, question_id: int) -> dict | None:
         async with self.db.execute(
-            """SELECT q.id, q.task_number, q.text, q.image_url, q.answer,
-                      q.explanation, s.code AS subject_code, s.name AS subject_name
+            """SELECT q.id, q.task_number, q.text, q.image_url,
+                      q.question_image_path, q.answer, q.explanation,
+                      q.solution_image_path, s.code AS subject_code, s.name AS subject_name
                FROM questions q
                JOIN subjects s ON q.subject_id = s.id
                WHERE q.id = ?""",

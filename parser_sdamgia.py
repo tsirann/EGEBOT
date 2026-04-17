@@ -1,268 +1,417 @@
 """
-Парсер ЕГЭ с сайта sdamgia.ru
-НЕ РАБОТАЕТ!!!
-Использование:
-    python parser_sdamgia.py --subject russian --tasks 1,2,3 --count 20
-    python parser_sdamgia.py --subject math_base --all --count 10
+Парсер заданий СдамГИА через sdamgia-api.
+
+Примеры:
+    python parser_sdamgia.py --subject russian --tasks 1,2,3 --count 5
+    python parser_sdamgia.py --subject math_profile --query "Найдите значение выражения" --count 3
+    python parser_sdamgia.py --all --count 2 --skip-screenshots
 """
 
-import asyncio
+from __future__ import annotations
+
 import argparse
+import asyncio
+import contextlib
+import io
 import logging
 import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-import aiohttp
-from bs4 import BeautifulSoup
+from sdamgia import SdamGIA
 
 from config import SUBJECTS
 from database import db
+from shot_task.reshu_screenshot import capture_screenshot
 
 logger = logging.getLogger(__name__)
 
-SDAMGIA_BASES = {
-    "russian": "https://rus-ege.sdamgia.ru",
-    "math_base": "https://mathb-ege.sdamgia.ru",
-    "math_profile": "https://math-ege.sdamgia.ru",
+SDAMGIA_SUBJECTS = {
+    "russian": "rus",
+    "math_base": "mathb",
+    "math_profile": "math",
 }
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9",
-}
+
+@dataclass(slots=True)
+class ScreenshotOptions:
+    enabled: bool = True
+    headless: bool = False
+    background: bool = False
+    timeout: int = 45
+    wait_ms: int = 400
+    profile_dir: Path | None = None
 
 
 class SdamgiaParser:
-    def __init__(self):
-        self.session: aiohttp.ClientSession | None = None
+    def __init__(
+        self,
+        *,
+        screenshot_options: ScreenshotOptions,
+        category_pages: int = 5,
+        search_pages: int = 3,
+        screenshot_root: Path | None = None,
+    ):
+        self.api = SdamGIA()
+        self.screenshot_options = screenshot_options
+        self.category_pages = max(1, category_pages)
+        self.search_pages = max(1, search_pages)
+        self.screenshot_root = (screenshot_root or (Path("data") / "screenshots")).resolve()
+        self._catalog_cache: dict[str, dict[int, list[str]]] = {}
 
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession(headers=HEADERS)
-        return self
+    async def _call_api(self, method_name: str, *args, **kwargs):
+        def runner():
+            method = getattr(self.api, method_name)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return method(*args, **kwargs)
 
-    async def __aexit__(self, *args):
-        if self.session:
-            await self.session.close()
+        return await asyncio.to_thread(runner)
 
-    async def _fetch(self, url: str) -> str | None:
-        try:
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    logger.warning("GET %s → %s", url, resp.status)
-                    return None
-                return await resp.text()
-        except Exception as e:
-            logger.error("Ошибка при запросе %s: %s", url, e)
-            return None
+    async def _capture_problem_screenshots(
+        self,
+        url: str,
+        subject: str,
+        task_number: int | None,
+        problem_id: str,
+    ) -> tuple[str | None, str | None]:
+        if not self.screenshot_options.enabled:
+            return None, None
 
-    # ── Получение ID задач со страницы каталога ──
+        task_dir = f"task_{task_number}" if task_number is not None else "task_unknown"
+        base_dir = (self.screenshot_root / subject / task_dir)
+        base_dir.mkdir(parents=True, exist_ok=True)
 
-    async def get_problem_ids(
-        self, subject: str, topic_id: int, max_count: int = 50
-    ) -> list[int]:
-        """Парсит страницу каталога/темы и возвращает ID задач."""
-        base = SDAMGIA_BASES[subject]
-        url = f"{base}/test?theme={topic_id}"
-        html = await self._fetch(url)
-        if not html:
+        condition_path = (base_dir / f"{problem_id}_condition.png").resolve()
+        solution_path = (base_dir / f"{problem_id}_solution.png").resolve()
+
+        def capture(mode: str, output_path: Path) -> str | None:
+            if output_path.exists():
+                return str(output_path)
+
+            try:
+                capture_screenshot(
+                    url,
+                    output_path=output_path,
+                    capture_mode=mode,  # type: ignore[arg-type]
+                    headless=self.screenshot_options.headless,
+                    background=self.screenshot_options.background,
+                    timeout=self.screenshot_options.timeout,
+                    wait_ms=self.screenshot_options.wait_ms,
+                    profile_dir=self.screenshot_options.profile_dir,
+                )
+                return str(output_path)
+            except Exception as exc:
+                logger.warning("Не удалось сделать %s-скриншот для %s: %s", mode, url, exc)
+                return None
+
+        condition_result = await asyncio.to_thread(capture, "condition", condition_path)
+        solution_result = await asyncio.to_thread(capture, "solution", solution_path)
+        return condition_result, solution_result
+
+    async def _get_catalog_map(self, subject: str) -> dict[int, list[str]]:
+        if subject in self._catalog_cache:
+            return self._catalog_cache[subject]
+
+        raw_subject = SDAMGIA_SUBJECTS[subject]
+        catalog = await self._call_api("get_catalog", raw_subject)
+        task_map: dict[int, list[str]] = {}
+
+        for topic in catalog:
+            topic_id = self._parse_task_number(topic.get("topic_id"))
+            if topic_id is None:
+                continue
+            task_map[topic_id] = [item["category_id"] for item in topic.get("categories", [])]
+
+        self._catalog_cache[subject] = task_map
+        return task_map
+
+    async def get_random_problem_ids_for_task(
+        self,
+        subject: str,
+        task_number: int,
+        max_count: int,
+        *,
+        existing_problem_ids: set[str] | None = None,
+    ) -> list[str]:
+        raw_subject = SDAMGIA_SUBJECTS[subject]
+        collected: list[str] = []
+        seen_ids = set(existing_problem_ids or set())
+        generated_ids: set[str] = set()
+        max_attempts = max(max_count * 12, 30)
+
+        for _ in range(max_attempts):
+            try:
+                test_id = await self._call_api("generate_test", raw_subject, {task_number: 1})
+                ids = await self._call_api("get_test_by_id", raw_subject, test_id)
+            except Exception as exc:
+                logger.warning(
+                    "Не удалось получить случайную задачу для %s №%s: %s",
+                    subject,
+                    task_number,
+                    exc,
+                )
+                continue
+
+            if not ids:
+                continue
+
+            for problem_id in ids:
+                if problem_id in seen_ids or problem_id in generated_ids:
+                    continue
+                generated_ids.add(problem_id)
+                collected.append(problem_id)
+                if len(collected) >= max_count:
+                    return collected
+
+        return collected
+
+    async def get_problem_ids_for_task(
+        self,
+        subject: str,
+        task_number: int,
+        max_count: int,
+    ) -> list[str]:
+        task_map = await self._get_catalog_map(subject)
+        category_ids = task_map.get(task_number, [])
+        if not category_ids:
+            logger.warning("Для задания %s не нашли категорий в каталоге", task_number)
             return []
 
-        soup = BeautifulSoup(html, "lxml")
-        ids: list[int] = []
+        raw_subject = SDAMGIA_SUBJECTS[subject]
+        unique_ids: list[str] = []
+        seen_ids: set[str] = set()
 
-        # Ищем ссылки на задачи вида problem?id=XXXXX
-        for link in soup.find_all("a", href=True):
-            m = re.search(r"problem\?id=(\d+)", link["href"])
-            if m:
-                pid = int(m.group(1))
-                if pid not in ids:
-                    ids.append(pid)
+        for category_id in category_ids:
+            for page in range(1, self.category_pages + 1):
+                ids = await self._call_api("get_category_by_id", raw_subject, category_id, page)
+                if not ids:
+                    break
 
-        # Также ищем скрытые поля и атрибуты data-*
-        for elem in soup.find_all(attrs={"data-id": True}):
-            try:
-                pid = int(elem["data-id"])
-                if pid not in ids:
-                    ids.append(pid)
-            except (ValueError, KeyError):
-                pass
+                page_added = 0
+                for problem_id in ids:
+                    if problem_id in seen_ids:
+                        continue
+                    seen_ids.add(problem_id)
+                    unique_ids.append(problem_id)
+                    page_added += 1
+                    if len(unique_ids) >= max_count:
+                        return unique_ids
 
-        return ids[:max_count]
+                if page_added == 0:
+                    break
 
-    # ── Парсинг одной задачи ──
+        return unique_ids[:max_count]
 
-    async def get_problem(self, subject: str, problem_id: int) -> dict | None:
-        """Получает текст задачи, ответ и пояснение по ID."""
-        base = SDAMGIA_BASES[subject]
-        url = f"{base}/problem?id={problem_id}"
-        html = await self._fetch(url)
-        if not html:
+    async def search_problem_ids(
+        self,
+        subject: str,
+        query: str,
+        max_count: int,
+    ) -> list[str]:
+        raw_subject = SDAMGIA_SUBJECTS[subject]
+        unique_ids: list[str] = []
+        seen_ids: set[str] = set()
+
+        for page in range(1, self.search_pages + 1):
+            ids = await self._call_api("search", raw_subject, query, page)
+            if not ids:
+                break
+
+            page_added = 0
+            for problem_id in ids:
+                if problem_id in seen_ids:
+                    continue
+                seen_ids.add(problem_id)
+                unique_ids.append(problem_id)
+                page_added += 1
+                if len(unique_ids) >= max_count:
+                    return unique_ids
+
+            if page_added == 0:
+                break
+
+        return unique_ids[:max_count]
+
+    async def get_problem(self, subject: str, problem_id: str) -> dict[str, Any] | None:
+        raw_subject = SDAMGIA_SUBJECTS[subject]
+        payload = await self._call_api("get_problem_by_id", raw_subject, problem_id)
+        if not payload:
             return None
 
-        soup = BeautifulSoup(html, "lxml")
+        condition = payload.get("condition") or {}
+        solution = payload.get("solution") or {}
+        answer = (payload.get("answer") or "").strip()
+        source_url = payload.get("url")
+        task_number = self._parse_task_number(payload.get("topic"))
 
-        # Текст задачи — ищем в нескольких возможных контейнерах
-        text_elem = (
-            soup.find("div", class_="pbody")
-            or soup.find("div", class_="condition")
-            or soup.find("div", class_="problem_text")
+        if not answer or not source_url or task_number is None:
+            logger.warning(
+                "Пропускаю задачу %s: не хватает данных (answer/url/task_number)",
+                problem_id,
+            )
+            return None
+
+        question_image_path, solution_image_path = await self._capture_problem_screenshots(
+            source_url,
+            subject,
+            task_number,
+            str(problem_id),
         )
 
-        if not text_elem:
-            # Пробуем найти по структуре страницы
-            content = soup.find("div", id="content")
-            if content:
-                nomarks = content.find_all("div", class_="nomark")
-                text_elem = nomarks[0] if nomarks else None
-
-        if not text_elem:
-            logger.debug("Не найден текст задачи %s", problem_id)
-            return None
-
-        text = text_elem.get_text(separator="\n", strip=True)
-        if len(text) < 10:
-            return None
-
-        # Ответ
-        answer = self._extract_answer(soup)
-        if not answer:
-            logger.debug("Не найден ответ для задачи %s", problem_id)
-            return None
-
-        # Номер задания
-        task_number = self._extract_task_number(soup)
-
-        # Пояснение (укороченное)
-        explanation = None
-        sol = soup.find("div", class_="solution")
-        if sol:
-            explanation = sol.get_text(separator="\n", strip=True)[:500]
-
-        # Картинки
-        images = []
-        if text_elem:
-            for img in text_elem.find_all("img"):
-                src = img.get("src", "")
-                if src and not src.startswith("http"):
-                    src = base + ("" if src.startswith("/") else "/") + src
-                if src:
-                    images.append(src)
-
         return {
-            "id": problem_id,
-            "text": text,
-            "answer": answer,
+            "id": str(problem_id),
             "task_number": task_number,
-            "explanation": explanation,
-            "images": images,
-            "source_url": url,
+            "text": (condition.get("text") or "").strip(),
+            "answer": answer,
+            "explanation": (solution.get("text") or "").strip() or None,
+            "condition_images": condition.get("images") or [],
+            "solution_images": solution.get("images") or [],
+            "question_image_path": question_image_path,
+            "solution_image_path": solution_image_path,
+            "source_url": source_url,
         }
 
-    def _extract_answer(self, soup: BeautifulSoup) -> str | None:
-        # Способ 1: блок с классом answer
-        ans_div = soup.find("div", class_="answer")
-        if ans_div:
-            raw = ans_div.get_text(strip=True)
-            raw = re.sub(r"^[Оо]твет\s*[:：.\s]*", "", raw).strip()
-            raw = raw.rstrip(".")
-            if raw:
-                return raw
-
-        # Способ 2: ищем «Ответ: ...» в тексте решения
-        for block in soup.find_all(["div", "p", "span"]):
-            m = re.search(r"[Оо]твет\s*[:：]\s*(.+?)(?:\.|<br|$)", block.get_text())
-            if m:
-                return m.group(1).strip()
-
-        return None
-
-    def _extract_task_number(self, soup: BeautifulSoup) -> int | None:
-        for elem in soup.find_all(["span", "div", "a", "td"]):
-            txt = elem.get_text()
-            m = re.search(r"(?:Задани[ея]|Задача|Номер|Тип)\s*(\d+)", txt)
-            if m:
-                num = int(m.group(1))
-                if 1 <= num <= 30:
-                    return num
-        return None
-
-    # ── Массовый парсинг ──
+    @staticmethod
+    def _parse_task_number(raw_value: Any) -> int | None:
+        if raw_value is None:
+            return None
+        match = re.search(r"\d+", str(raw_value))
+        if not match:
+            return None
+        return int(match.group())
 
     async def parse_subject(
         self,
         subject: str,
+        *,
         task_numbers: list[int] | None = None,
+        query: str | None = None,
         per_task: int = 10,
         delay: float = 0.5,
-    ) -> list[dict]:
-        """Парсит задачи для предмета.
+        skip_existing: bool = True,
+    ) -> list[dict[str, Any]]:
+        all_problems: list[dict[str, Any]] = []
 
-        Args:
-            subject: код предмета (russian / math_base / math_profile)
-            task_numbers: список номеров заданий (None = все)
-            per_task: сколько задач на каждый номер
-            delay: задержка между запросами (секунды)
-        """
+        if query:
+            logger.info("Поиск задач по запросу %r для %s", query, subject)
+            existing_source_ids = (
+                await db.get_existing_source_ids(subject) if skip_existing else set()
+            )
+            ids = await self.search_problem_ids(subject, query, max_count=per_task)
+            for index, problem_id in enumerate(ids, start=1):
+                source_id = f"sdamgia_{problem_id}"
+                if source_id in existing_source_ids:
+                    logger.info("  [%s/%s] Пропускаю задачу %s: уже есть в БД", index, len(ids), problem_id)
+                    continue
+                logger.info("  [%s/%s] Загружаю задачу %s", index, len(ids), problem_id)
+                problem = await self.get_problem(subject, problem_id)
+                if problem:
+                    all_problems.append(problem)
+                await asyncio.sleep(delay)
+            return all_problems
+
         info = SUBJECTS[subject]
         if task_numbers is None:
             task_numbers = list(range(1, info["task_count"] + 1))
 
-        all_problems: list[dict] = []
-
-        for task_num in task_numbers:
-            logger.info("Парсинг %s, задание №%s ...", subject, task_num)
-
-            ids = await self.get_problem_ids(subject, task_num, max_count=per_task * 3)
+        for task_number in task_numbers:
+            logger.info("Парсинг %s, задание №%s ...", subject, task_number)
+            existing_source_ids = (
+                await db.get_existing_source_ids(subject, task_number) if skip_existing else set()
+            )
+            existing_problem_ids = {
+                source_id.removeprefix("sdamgia_")
+                for source_id in existing_source_ids
+                if source_id.startswith("sdamgia_")
+            }
+            ids = await self.get_random_problem_ids_for_task(
+                subject,
+                task_number,
+                max_count=per_task * 4,
+                existing_problem_ids=existing_problem_ids,
+            )
+            if len(ids) < per_task:
+                fallback_ids = await self.get_problem_ids_for_task(
+                    subject,
+                    task_number,
+                    max_count=per_task * 20,
+                )
+                random_id_set = set(ids)
+                ids.extend(problem_id for problem_id in fallback_ids if problem_id not in random_id_set)
             if not ids:
-                logger.warning("  Не найдены ID задач для темы %s", task_num)
+                logger.warning("  Не нашли задач для задания №%s", task_number)
                 continue
 
-            count = 0
-            for pid in ids:
-                if count >= per_task:
+            saved_for_task = 0
+            for problem_id in ids:
+                if saved_for_task >= per_task:
                     break
 
-                problem = await self.get_problem(subject, pid)
-                if problem and problem["answer"]:
-                    if problem["task_number"] is None:
-                        problem["task_number"] = task_num
-                    all_problems.append(problem)
-                    count += 1
+                source_id = f"sdamgia_{problem_id}"
+                if source_id in existing_source_ids:
+                    logger.info("  Пропускаю задачу %s: уже есть в БД", problem_id)
+                    continue
 
+                problem = await self.get_problem(subject, problem_id)
+                if not problem:
+                    await asyncio.sleep(delay)
+                    continue
+
+                actual_task_number = problem.get("task_number")
+                if actual_task_number is not None and actual_task_number != task_number:
+                    logger.info(
+                        "  Пропускаю задачу %s: API пометил ее как задание №%s, а не №%s",
+                        problem_id,
+                        actual_task_number,
+                        task_number,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                problem["task_number"] = task_number
+                all_problems.append(problem)
+                saved_for_task += 1
+                existing_source_ids.add(source_id)
                 await asyncio.sleep(delay)
 
-            logger.info("  Получено %s задач", count)
+            logger.info("  Получено %s задач", saved_for_task)
 
         return all_problems
 
 
-async def save_problems(problems: list[dict], subject: str):
-    """Сохраняет распарсенные задачи в БД."""
-    saved = 0
-    for p in problems:
-        qid = await db.add_question(
+async def save_problems(problems: list[dict[str, Any]], subject: str) -> dict[str, int]:
+    stats = {
+        "added": 0,
+        "updated": 0,
+    }
+    for problem in problems:
+        source_id = f"sdamgia_{problem['id']}"
+        existing_id = await db.get_question_id_by_source(subject, source_id)
+        question_id = await db.add_question(
             subject_code=subject,
-            task_number=p["task_number"],
-            text=p["text"],
-            answer=p["answer"],
-            explanation=p.get("explanation"),
-            image_url=p["images"][0] if p.get("images") else None,
-            source_url=p.get("source_url"),
-            source_id=f"sdamgia_{p['id']}",
+            task_number=problem["task_number"],
+            text=problem["text"] or f"Задача СдамГИА {problem['id']}",
+            answer=problem["answer"],
+            explanation=problem.get("explanation"),
+            image_url=(problem.get("condition_images") or [None])[0],
+            question_image_path=problem.get("question_image_path"),
+            solution_image_path=problem.get("solution_image_path"),
+            source_url=problem.get("source_url"),
+            source_id=source_id,
         )
-        if qid:
-            saved += 1
-    return saved
+        if question_id:
+            if existing_id is None:
+                stats["added"] += 1
+            else:
+                stats["updated"] += 1
+    return stats
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="Парсер заданий ЕГЭ с sdamgia.ru")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Парсер заданий ЕГЭ через sdamgia-api")
     parser.add_argument(
         "--subject",
-        required=True,
         choices=list(SUBJECTS.keys()),
         help="Предмет: russian, math_base, math_profile",
     )
@@ -272,10 +421,15 @@ async def main():
         help="Номера заданий через запятую (по умолчанию: все)",
     )
     parser.add_argument(
+        "--query",
+        default=None,
+        help="Текстовый поисковый запрос по базе СдамГИА",
+    )
+    parser.add_argument(
         "--count",
         type=int,
         default=10,
-        help="Количество задач на каждый номер (по умолчанию: 10)",
+        help="Количество задач на каждый номер или по поисковому запросу",
     )
     parser.add_argument(
         "--all",
@@ -289,8 +443,60 @@ async def main():
         default=0.5,
         help="Задержка между запросами в секундах",
     )
+    parser.add_argument(
+        "--category-pages",
+        type=int,
+        default=5,
+        help="Сколько страниц категории просматривать при сборе по номеру задания",
+    )
+    parser.add_argument(
+        "--search-pages",
+        type=int,
+        default=3,
+        help="Сколько страниц поисковой выдачи просматривать при --query",
+    )
+    parser.add_argument(
+        "--skip-screenshots",
+        action="store_true",
+        help="Не делать скриншоты условия и решения",
+    )
+    parser.add_argument(
+        "--allow-existing",
+        action="store_true",
+        help="Не пропускать задачи, которые уже есть в БД",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Делать скриншоты в headless-режиме",
+    )
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="Открывать браузер для скриншотов вне экрана",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=45,
+        help="Таймаут загрузки страницы для скриншота",
+    )
+    parser.add_argument(
+        "--wait-ms",
+        type=int,
+        default=400,
+        help="Сколько миллисекунд ждать перед сохранением скриншота",
+    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
+
+async def main():
+    args = parse_args()
+
+    if not args.parse_all and not args.subject:
+        raise SystemExit("Нужно указать --subject или использовать --all")
+    if args.parse_all and args.query:
+        raise SystemExit("Режим --all нельзя комбинировать с --query")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -300,24 +506,39 @@ async def main():
     await db.connect()
 
     subjects_to_parse = list(SUBJECTS.keys()) if args.parse_all else [args.subject]
+    screenshot_options = ScreenshotOptions(
+        enabled=not args.skip_screenshots,
+        headless=args.headless,
+        background=args.background,
+        timeout=args.timeout,
+        wait_ms=args.wait_ms,
+    )
+    parser = SdamgiaParser(
+        screenshot_options=screenshot_options,
+        category_pages=args.category_pages,
+        search_pages=args.search_pages,
+    )
 
-    for subj in subjects_to_parse:
+    for subject in subjects_to_parse:
         task_numbers = None
-        if args.tasks and not args.parse_all:
-            task_numbers = [int(x.strip()) for x in args.tasks.split(",")]
+        if args.tasks and not args.query:
+            task_numbers = [int(item.strip()) for item in args.tasks.split(",") if item.strip()]
 
-        async with SdamgiaParser() as parser_inst:
-            problems = await parser_inst.parse_subject(
-                subj,
-                task_numbers=task_numbers,
-                per_task=args.count,
-                delay=args.delay,
-            )
-
-        saved = await save_problems(problems, subj)
+        problems = await parser.parse_subject(
+            subject,
+            task_numbers=task_numbers,
+            query=args.query,
+            per_task=args.count,
+            delay=args.delay,
+            skip_existing=not args.allow_existing,
+        )
+        save_stats = await save_problems(problems, subject)
         logger.info(
-            "Предмет %s: найдено %s задач, сохранено %s",
-            subj, len(problems), saved,
+            "Предмет %s: найдено %s задач, добавлено %s, обновлено %s",
+            subject,
+            len(problems),
+            save_stats["added"],
+            save_stats["updated"],
         )
 
     await db.close()
